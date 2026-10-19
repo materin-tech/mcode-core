@@ -14,7 +14,7 @@ MCode 的核心库：从终端 CLI（mcode-cli）与桌面版（MCode_Desktop）
 ## 消费方
 
 - [mcode-cli](https://github.com/materin-tech/mcode-cli) — 终端 TUI（ratatui），依赖本仓库 git tag
-- MCode_Desktop — gpui 桌面版（迁移中）
+- [MCode_Desktop](https://github.com/materin-tech/MCode_Desktop) — gpui 桌面版，依赖本仓库 git tag
 
 ## 用法
 
