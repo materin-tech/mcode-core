@@ -215,6 +215,24 @@ pub const COMMANDS: &[CommandDef] = &[
         mcode_only: true,
     },
     CommandDef {
+        name: "/skill",
+        group: "扩展生态",
+        desc: "技能创建/安装/移除：create|install|remove",
+        mcode_only: true,
+    },
+    CommandDef {
+        name: "/agent",
+        group: "扩展生态",
+        desc: "subagent 创建/安装/移除：create|install|remove",
+        mcode_only: true,
+    },
+    CommandDef {
+        name: "/provider",
+        group: "配置与状态",
+        desc: "模型供应商管理：add|list|use|remove",
+        mcode_only: true,
+    },
+    CommandDef {
         name: "/history",
         group: "账号与帮助",
         desc: "诊断输入历史召回",
