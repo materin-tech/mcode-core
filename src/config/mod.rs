@@ -146,7 +146,10 @@ impl Config {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        // 原子写：先写同目录临时文件再 rename，进程被杀/磁盘满不会留下半个 config.json
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -186,6 +189,74 @@ impl Config {
         if self.active_model().is_none() {
             anyhow::bail!("未选择模型");
         }
+        Ok(())
+    }
+
+    // ---------- Provider CRUD（设置页 / CLI 子命令共用的原语） ----------
+
+    /// 新增 provider：重名拒绝、至少一个模型；providers 为空时自动激活并选中首个模型
+    /// （对齐 CLI add_provider 子命令行为）
+    pub fn add_provider(&mut self, p: Provider) -> Result<()> {
+        anyhow::ensure!(!p.name.trim().is_empty(), "供应商名称不能为空");
+        anyhow::ensure!(!p.models.is_empty(), "供应商 {} 至少需要一个模型", p.name);
+        anyhow::ensure!(
+            !self.providers.iter().any(|x| x.name == p.name),
+            "供应商 {} 已存在",
+            p.name
+        );
+        let is_first = self.providers.is_empty();
+        self.providers.push(p);
+        if is_first {
+            self.active_provider = self.providers.last().map(|x| x.name.clone());
+            self.active_model = self
+                .providers
+                .last()
+                .and_then(|x| x.models.first().cloned());
+        }
+        Ok(())
+    }
+
+    /// 按 name 整体替换 provider（不存在报错）；active 状态不受影响
+    pub fn update_provider(&mut self, p: Provider) -> Result<()> {
+        anyhow::ensure!(!p.models.is_empty(), "供应商 {} 至少需要一个模型", p.name);
+        let entry = self
+            .providers
+            .iter_mut()
+            .find(|x| x.name == p.name)
+            .with_context(|| format!("供应商 {} 不存在", p.name))?;
+        *entry = p;
+        Ok(())
+    }
+
+    /// 删除 provider；删除的是 active 时回落到剩余首个（无剩余则清空激活态）
+    pub fn remove_provider(&mut self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.providers.iter().any(|x| x.name == name),
+            "供应商 {name} 不存在"
+        );
+        self.providers.retain(|x| x.name != name);
+        if self.active_provider.as_deref() == Some(name) {
+            self.active_provider = self.providers.first().map(|x| x.name.clone());
+            self.active_model = self
+                .providers
+                .first()
+                .and_then(|x| x.models.first().cloned());
+        }
+        Ok(())
+    }
+
+    /// 切换激活 provider；active_model 重置为该 provider 首个模型（对齐 CLI switch）
+    pub fn set_active_provider(&mut self, name: &str) -> Result<()> {
+        let first = self
+            .providers
+            .iter()
+            .find(|x| x.name == name)
+            .with_context(|| format!("供应商 {name} 不存在"))?
+            .models
+            .first()
+            .cloned();
+        self.active_provider = Some(name.to_string());
+        self.active_model = first;
         Ok(())
     }
 }
@@ -333,7 +404,39 @@ impl DesktopConfig {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let json = serde_json::to_string_pretty(self)?;
+        // 原子写：同 config.json（temp + rename）
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    // ---------- MCP server CRUD（拓展页 / CLI /mcp 子命令共用原语） ----------
+
+    /// 按 name 幂等 upsert：已存在则整体替换，不存在则追加
+    pub fn upsert_mcp_server(&mut self, s: McpServerConfig) {
+        match self.mcp_servers.iter_mut().find(|x| x.name == s.name) {
+            Some(slot) => *slot = s,
+            None => self.mcp_servers.push(s),
+        }
+    }
+
+    /// 删除 MCP server；返回是否确有删除
+    pub fn remove_mcp_server(&mut self, name: &str) -> bool {
+        let before = self.mcp_servers.len();
+        self.mcp_servers.retain(|x| x.name != name);
+        self.mcp_servers.len() != before
+    }
+
+    /// 启用/停用 server（停用后启动不再自动连接）；不存在报错
+    pub fn set_mcp_enabled(&mut self, name: &str, enabled: bool) -> Result<()> {
+        let slot = self
+            .mcp_servers
+            .iter_mut()
+            .find(|x| x.name == name)
+            .with_context(|| format!("MCP server {name} 不存在"))?;
+        slot.enabled = enabled;
         Ok(())
     }
 }
@@ -456,6 +559,121 @@ mod tests {
         let mut c = Config::default();
         c.providers.push(Provider::default());
         assert!(!c.needs_onboarding());
+    }
+
+    fn prov(name: &str, models: &[&str]) -> Provider {
+        Provider {
+            name: name.into(),
+            base_url: format!("https://{name}.example.com/v1"),
+            api_key_env: format!("{name}_KEY").to_uppercase(),
+            models: models.iter().map(|s| s.to_string()).collect(),
+            multimodal_models: vec![],
+        }
+    }
+
+    #[test]
+    fn provider_crud_full_lifecycle() {
+        let mut c = Config::default();
+        // 空 providers → 新增首个自动激活
+        c.add_provider(prov("glm", &["glm-1", "glm-2"])).unwrap();
+        assert_eq!(c.active_provider.as_deref(), Some("glm"));
+        assert_eq!(c.active_model().as_deref(), Some("glm-1"));
+
+        // 重名拒绝
+        assert!(c.add_provider(prov("glm", &["x"])).is_err());
+        // 空名拒绝
+        assert!(c.add_provider(prov("  ", &["x"])).is_err());
+
+        // 第二个 provider 不抢占 active
+        c.add_provider(prov("minimax", &["MiniMax-M3"])).unwrap();
+        assert_eq!(c.active_provider.as_deref(), Some("glm"));
+
+        // update：整体替换且 active 保持
+        let mut m = prov("minimax", &["MiniMax-M3", "abab6"]);
+        m.base_url = "https://api.minimaxi.com/anthropic".into();
+        c.update_provider(m).unwrap();
+        assert_eq!(c.active_provider.as_deref(), Some("glm"));
+        assert_eq!(
+            c.providers
+                .iter()
+                .find(|p| p.name == "minimax")
+                .unwrap()
+                .base_url,
+            "https://api.minimaxi.com/anthropic"
+        );
+        // update 不存在的
+        assert!(c.update_provider(prov("ghost", &["g"])).is_err());
+
+        // 切换 → active_model 重置为首模型
+        c.set_active_provider("minimax").unwrap();
+        assert_eq!(c.active_provider.as_deref(), Some("minimax"));
+        assert_eq!(c.active_model().as_deref(), Some("MiniMax-M3"));
+
+        // 删 active → 回落到剩余首个 + 首模型
+        c.remove_provider("minimax").unwrap();
+        assert_eq!(c.active_provider.as_deref(), Some("glm"));
+        assert_eq!(c.active_model().as_deref(), Some("glm-1"));
+
+        // 删不存在的报错；删到只剩空 → active 清空
+        assert!(c.remove_provider("ghost").is_err());
+        c.remove_provider("glm").unwrap();
+        assert!(c.active_provider.is_none() && c.providers.is_empty());
+    }
+
+    #[test]
+    fn save_to_is_atomic_no_tmp_left_behind() {
+        let dir = std::env::temp_dir().join(format!("mcode-cfg-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut c = Config::default();
+        c.add_provider(prov("glm", &["glm-1"])).unwrap();
+        c.save_to(&path).unwrap();
+        // 无 .tmp 残留
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1, "目录应只剩 config.json: {entries:?}");
+        // roundtrip 等值
+        let back = Config::try_load_from(&path).unwrap();
+        assert_eq!(back.active_provider.as_deref(), Some("glm"));
+        assert_eq!(back.providers.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_server_crud() {
+        let mut d = DesktopConfig::default();
+        let s0 = McpServerConfig {
+            name: "fs".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "@modelcontextprotocol/server-fs".into()],
+            env: Default::default(),
+            enabled: true,
+        };
+        d.upsert_mcp_server(s0.clone());
+        // upsert 幂等覆盖
+        let mut s1 = s0.clone();
+        s1.command = "node".into();
+        d.upsert_mcp_server(s1);
+        assert_eq!(d.mcp_servers.len(), 1);
+        assert_eq!(d.mcp_servers[0].command, "node");
+
+        // enable/disable + 不存在报错
+        d.set_mcp_enabled("fs", false).unwrap();
+        assert!(!d.mcp_servers[0].enabled);
+        assert!(d.set_mcp_enabled("ghost", true).is_err());
+
+        d.upsert_mcp_server(McpServerConfig {
+            name: "git".into(),
+            command: "uvx".into(),
+            args: vec![],
+            env: Default::default(),
+            enabled: false,
+        });
+        d.set_mcp_enabled("git", true).unwrap();
+        // remove
+        assert!(d.remove_mcp_server("fs"));
+        assert!(!d.remove_mcp_server("fs"), "重复删除返回 false");
+        assert_eq!(d.mcp_servers.len(), 1);
     }
 }
 

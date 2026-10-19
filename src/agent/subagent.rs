@@ -8,7 +8,7 @@
 use super::history::HistoryStore;
 use super::runner::{AgentDeps, TurnOpts, run_agent_turn};
 use crate::tools::{Tool, ToolContext, ToolDefinition, ToolResult, clamp_output};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -297,5 +297,137 @@ impl Tool for TaskTool {
                 lines: String::new(),
             }),
         })
+    }
+}
+
+// ---------- 管理原语（create / install / remove，供 CLI 与桌面端共用） ----------
+
+fn agents_base(base_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    base_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| crate::util::mcode_dir().join("agents"))
+}
+
+pub fn validate_agent_name(name: &str) -> anyhow::Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    anyhow::ensure!(ok, "非法 agent 名 `{name}`（仅限字母数字-_，≤64 字符）");
+    Ok(())
+}
+
+/// 模板创建：写 `<base>/<name>.md`（frontmatter + 正文 = system prompt），已存在拒绝
+pub fn create_agent(
+    name: &str,
+    description: &str,
+    system_prompt: &str,
+    tools: Option<Vec<String>>,
+    base_dir: Option<&std::path::Path>,
+) -> anyhow::Result<std::path::PathBuf> {
+    validate_agent_name(name)?;
+    anyhow::ensure!(
+        !description.trim().is_empty(),
+        "description 不能为空（主模型据此决定何时派发）"
+    );
+    anyhow::ensure!(
+        !system_prompt.trim().is_empty(),
+        "system_prompt（正文）不能为空"
+    );
+    let dir = agents_base(base_dir);
+    let path = dir.join(format!("{name}.md"));
+    anyhow::ensure!(!path.exists(), "agent `{name}` 已存在于 {}", path.display());
+    std::fs::create_dir_all(&dir)?;
+    let tools_line = tools
+        .map(|t| format!("tools: {}\n", t.join(", ")))
+        .unwrap_or_default();
+    let md = format!(
+        "---\nname: {name}\ndescription: {}\n{tools_line}---\n{}\n",
+        description.trim(),
+        system_prompt.trim()
+    );
+    std::fs::write(&path, md)?;
+    Ok(path)
+}
+
+/// 本地文件安装：必须能解析出合法 frontmatter，落到 `<base>/<frontmatter-name>.md`
+pub fn install_agent_from_file(
+    src: &std::path::Path,
+    base_dir: Option<&std::path::Path>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let text =
+        std::fs::read_to_string(src).with_context(|| format!("读取失败：{}", src.display()))?;
+    let def = parse_agent_md(&text)
+        .ok_or_else(|| anyhow::anyhow!("frontmatter 解析失败或正文为空：{}", src.display()))?;
+    validate_agent_name(&def.name)?;
+    let dir = agents_base(base_dir);
+    let path = dir.join(format!("{}.md", def.name));
+    anyhow::ensure!(
+        !path.exists(),
+        "agent `{}` 已存在于 {}",
+        def.name,
+        path.display()
+    );
+    std::fs::create_dir_all(&dir)?;
+    std::fs::copy(src, &path)?;
+    Ok(path)
+}
+
+/// 移除：仅限用户级 `<base>/<name>.md`；内置层不受此 API 支配。返回是否真的删除。
+pub fn remove_agent(name: &str, base_dir: Option<&std::path::Path>) -> anyhow::Result<bool> {
+    validate_agent_name(name)?;
+    let path = agents_base(base_dir).join(format!("{name}.md"));
+    if !path.is_file() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_lifecycle_primitives() {
+        let base = std::env::temp_dir().join(format!("mcode-agents-{}-life", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = create_agent(
+            "demo-agent",
+            "demo desc",
+            "You are a demo.",
+            Some(vec!["read_file".into(), "glob".into()]),
+            Some(&base),
+        )
+        .unwrap();
+        assert_eq!(dir, base.join("demo-agent.md"));
+        let text = std::fs::read_to_string(&dir).unwrap();
+        let def = parse_agent_md(&text).unwrap();
+        let (n, d, t) = (def.name.clone(), def.description.clone(), def.tools.clone());
+        assert_eq!(n, "demo-agent");
+        assert_eq!(d, "demo desc");
+        assert_eq!(t, Some(vec!["read_file".into(), "glob".into()]));
+        // create 重复拒绝
+        assert!(create_agent("demo-agent", "x", "y", None, Some(&base)).is_err());
+        // install：合法文件按 frontmatter 名落盘
+        let src = base.join("src.md");
+        std::fs::write(
+            &src,
+            "---\nname: inst-agent\ndescription: install test\n---\nbody here",
+        )
+        .unwrap();
+        let got = install_agent_from_file(&src, Some(&base)).unwrap();
+        assert_eq!(got, base.join("inst-agent.md"));
+        // install 重复 / 不可解析拒绝
+        assert!(install_agent_from_file(&src, Some(&base)).is_err());
+        let bad = base.join("bad.md");
+        std::fs::write(&bad, "no frontmatter here").unwrap();
+        assert!(install_agent_from_file(&bad, Some(&base)).is_err());
+        // remove 命中 true / 未命中 false
+        assert!(remove_agent("inst-agent", Some(&base)).unwrap());
+        assert!(!remove_agent("ghost", Some(&base)).unwrap());
+        std::fs::write(&src, "---\nname: demo-agent\ndescription: dup").unwrap();
+        assert!(install_agent_from_file(&src, Some(&base)).is_err());
     }
 }

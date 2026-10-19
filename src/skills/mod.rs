@@ -4,6 +4,7 @@
 
 //! Skill 加载 — 渐进式披露（MCode.md 3.3）：仅 name+description 常驻上下文，命中后展开 body
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -96,16 +97,130 @@ fn dedup(skills: Vec<Skill>) -> Vec<Skill> {
     map.into_values().collect()
 }
 
+// ---------- 管理原语（create / install / remove，供 CLI 与桌面端共用） ----------
+
+/// skill 名合法性：字母/数字/连字符/下划线，防路径逃逸与非法文件名
+pub fn validate_skill_name(name: &str) -> anyhow::Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    anyhow::ensure!(ok, "非法 skill 名 `{name}`（仅限字母数字-_，≤64 字符）");
+    Ok(())
+}
+
+/// skill 安装基目录：project_dir 有则项目级 `.mcode/skills`，否则用户级 `~/.mcode/skills`
+fn skills_base(project_dir: Option<&Path>) -> std::path::PathBuf {
+    match project_dir {
+        Some(p) => p.join(".mcode/skills"),
+        None => crate::util::mcode_dir().join("skills"),
+    }
+}
+
+/// 模板创建：写入 `<base>/<name>/SKILL.md`（frontmatter + body），已存在则拒绝
+pub fn create_skill(
+    name: &str,
+    description: &str,
+    body: &str,
+    project_dir: Option<&Path>,
+) -> anyhow::Result<std::path::PathBuf> {
+    validate_skill_name(name)?;
+    anyhow::ensure!(
+        !description.trim().is_empty(),
+        "description 不能为空（它是常驻上下文的唯一线索）"
+    );
+    let dir = skills_base(project_dir).join(name);
+    anyhow::ensure!(!dir.exists(), "skill `{name}` 已存在于 {}", dir.display());
+    std::fs::create_dir_all(&dir)?;
+    let md = format!(
+        "---\nname: {name}\ndescription: {}\n---\n{}\n",
+        description.trim(),
+        body.trim()
+    );
+    std::fs::write(dir.join("SKILL.md"), md)?;
+    Ok(dir)
+}
+
+/// 本地目录安装：源目录必须含 SKILL.md，整目录拷贝到 `<base>/<skill名>/`
+pub fn install_skill_from_dir(
+    src: &Path,
+    project_dir: Option<&Path>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let src_md = src.join("SKILL.md");
+    anyhow::ensure!(src_md.is_file(), "源目录缺少 SKILL.md：{}", src.display());
+    let text = std::fs::read_to_string(&src_md)?;
+    let (name, _, _) = parse_skill_md(&text)
+        .with_context(|| format!("SKILL.md frontmatter 解析失败：{}", src.display()))?;
+    validate_skill_name(&name)?;
+    let dir = skills_base(project_dir).join(&name);
+    anyhow::ensure!(!dir.exists(), "skill `{name}` 已存在于 {}", dir.display());
+    crate::util::copy_tree(src, &dir)
+        .with_context(|| format!("拷贝 {} → {} 失败", src.display(), dir.display()))?;
+    Ok(dir)
+}
+
+/// 移除：仅限可写层（用户级 / 项目级），内置 assets 层不受此 API 支配。
+/// 返回是否真的删除了目录。
+pub fn remove_skill(name: &str, project_dir: Option<&Path>) -> anyhow::Result<bool> {
+    validate_skill_name(name)?;
+    let dir = skills_base(project_dir).join(name);
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(true)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_frontmatter() {
-        let md = "---\nname: pua\ndescription: 效率教练\n---\n正文内容";
+        let md = r#"---
+name: skill-a
+description: demo
+---
+BODY"#;
         let (n, d, b) = parse_skill_md(md).unwrap();
-        assert_eq!(n, "pua");
-        assert_eq!(d, "效率教练");
-        assert_eq!(b, "正文内容");
+        assert_eq!(n, "skill-a");
+        assert_eq!(d, "demo");
+        assert_eq!(b, "BODY");
+    }
+
+    #[test]
+    fn skill_lifecycle_primitives() {
+        let base = std::env::temp_dir().join(format!("mcode-skills-{}-life", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let dir = create_skill("demo-skill", "demo desc", "body text", Some(&project)).unwrap();
+        assert_eq!(dir, project.join(".mcode/skills/demo-skill"));
+        assert!(dir.join("SKILL.md").is_file());
+        // create 重复拒绝
+        assert!(create_skill("demo-skill", "x", "y", Some(&project)).is_err());
+        // install：名字取自 frontmatter
+        let src = base.join("src-skill");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: inst-al\ndescription: install test\n---\nbody",
+        )
+        .unwrap();
+        let got = install_skill_from_dir(&src, Some(&project)).unwrap();
+        assert_eq!(got, project.join(".mcode/skills/inst-al"));
+        // install 重复拒绝 / 缺 SKILL.md 拒绝
+        assert!(install_skill_from_dir(&src, Some(&project)).is_err());
+        assert!(install_skill_from_dir(&base, Some(&project)).is_err());
+        // remove 命中 true / 未命中 false / 非法名拒绝
+        assert!(remove_skill("inst-al", Some(&project)).unwrap());
+        assert!(!remove_skill("ghost", Some(&project)).unwrap());
+        assert!(remove_skill("../evil", Some(&project)).is_err());
+        // create+load_all roundtrip
+        create_skill("roundtrip", "rt desc", "rt body", Some(&project)).unwrap();
+        let loaded = load_all(&project);
+        let hit = loaded.iter().find(|s| s.entry.name == "roundtrip").unwrap();
+        assert_eq!(hit.entry.source, "project");
+        assert_eq!(hit.body, "rt body");
     }
 }

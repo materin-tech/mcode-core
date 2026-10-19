@@ -160,8 +160,8 @@ pub fn materialize_bundled_assets() -> usize {
     n
 }
 
-/// 递归复制目录（物化用；文件操作工具另有带钳制/防逃逸的实现）
-fn copy_tree(from: &PathBuf, to: &PathBuf) -> std::io::Result<()> {
+/// 递归复制目录（物化与 skill 安装共用；文件操作工具另有带钳制/防逃逸的实现）
+pub fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
