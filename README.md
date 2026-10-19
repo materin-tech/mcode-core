@@ -20,7 +20,7 @@ MCode 的核心库：从终端 CLI（mcode-cli）与桌面版（MCode_Desktop）
 
 ```toml
 [dependencies]
-mcode-core = { git = "https://github.com/materin-tech/mcode-core", tag = "v0.1.0-beta.6" }
+mcode-core = { git = "https://github.com/materin-tech/mcode-core", tag = "v0.1.0-beta.7" }
 ```
 
 本地联调（同时开发 core 与消费方时），在 `~/.cargo/config.toml` 加：

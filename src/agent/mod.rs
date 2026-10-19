@@ -168,6 +168,9 @@ pub trait ModelBackend: Send + Sync {
 /// 自动压缩触发比例：上下文超过模型窗口的 80% 即压缩
 pub const AUTO_COMPACT_RATIO: f64 = 0.8;
 
+/// UI 上下文预算展示上限（固定兜底值；模型窗口可经 context_window_for_model 细化）
+pub const CONTEXT_LIMIT_TOKENS: usize = 160_000;
+
 /// 按模型名推断上下文窗口（估算表，token；未知模型回退 128k）
 pub fn context_window_for_model(model: &str) -> usize {
     let m = model.to_ascii_lowercase();
