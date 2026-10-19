@@ -80,6 +80,8 @@ impl SessionStore {
             meta,
         };
         s.flush_meta()?;
+        // 空消息流也落盘：桌面端「新建会话」立即入列且可直接 resume（load 无条件读 jsonl）
+        std::fs::write(&s.jsonl_path, b"")?;
         Ok(s)
     }
 
@@ -182,6 +184,35 @@ impl SessionStore {
         }
     }
 
+    /// 会话重命名（桌面端右键菜单数据源）：读 meta → 校验标题 → 写回。
+    /// 仅改标题不动消息流；meta 缺失报错（含 id 拼写错误防御）。
+    pub fn rename(cwd: &std::path::Path, id: &str, title: &str) -> Result<()> {
+        let dir = crate::util::sessions_dir(cwd);
+        let meta_path = dir.join(format!("{id}.meta.json"));
+        let mut meta: SessionMeta = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
+        let title = title.trim();
+        if title.is_empty() {
+            anyhow::bail!("会话标题不能为空");
+        }
+        meta.title = title.to_string();
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+        Ok(())
+    }
+
+    /// 删除会话：meta + 消息流 + 检查点一并删除（对齐 cleanup_expired_in 的文件清单）。
+    /// meta 不存在报错（重复删除/拼写错误防御），其余文件缺失忽略。
+    pub fn delete(cwd: &std::path::Path, id: &str) -> Result<()> {
+        let dir = crate::util::sessions_dir(cwd);
+        let meta_path = dir.join(format!("{id}.meta.json"));
+        if !meta_path.exists() {
+            anyhow::bail!("会话不存在：{id}");
+        }
+        for suffix in [".meta.json", ".jsonl", ".checkpoints.jsonl"] {
+            let _ = std::fs::remove_file(dir.join(format!("{id}{suffix}")));
+        }
+        Ok(())
+    }
+
     /// 检查点：写文件 / bash 修改前留存快照标记（rewind 数据源）
     pub fn add_checkpoint(&mut self, desc: &str) -> Result<()> {
         let ck_path = self.jsonl_path.with_extension("checkpoints.jsonl");
@@ -247,6 +278,7 @@ fn cleanup_expired_in(root: &std::path::Path, retention_days: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Role;
 
     fn meta_with_updated(updated: &str) -> SessionMeta {
         SessionMeta {
@@ -325,5 +357,58 @@ mod tests {
         assert!(sessions.join("broken.meta.json").exists());
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn temp_cwd() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("mcode-sessions-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn create_touches_empty_jsonl_so_resume_works() {
+        let cwd = temp_cwd();
+        let s = SessionStore::create(&cwd).unwrap();
+        // 新建会话（未发消息）即可被 load：桌面端新建即入列 + 直接 resume 的前提
+        let (_, msgs) = SessionStore::load(&cwd, &s.meta.id).unwrap();
+        assert!(msgs.is_empty());
+        let _ = std::fs::remove_dir_all(crate::util::sessions_dir(&cwd).parent().unwrap());
+    }
+
+    #[test]
+    fn rename_updates_meta_title_on_disk() {
+        let cwd = temp_cwd();
+        let mut s = SessionStore::create(&cwd).unwrap();
+        s.append_message(&Message::text(Role::User, "hi")).unwrap();
+        SessionStore::rename(&cwd, &s.meta.id, "  新标题  ").unwrap();
+        let (s2, _) = SessionStore::load(&cwd, &s.meta.id).unwrap();
+        assert_eq!(s2.meta.title, "新标题");
+        let _ = std::fs::remove_dir_all(crate::util::sessions_dir(&cwd).parent().unwrap());
+    }
+
+    #[test]
+    fn rename_rejects_blank_title_and_missing_session() {
+        let cwd = temp_cwd();
+        let s = SessionStore::create(&cwd).unwrap();
+        assert!(SessionStore::rename(&cwd, &s.meta.id, "   ").is_err());
+        assert!(SessionStore::rename(&cwd, "no-such-id", "x").is_err());
+        let _ = std::fs::remove_dir_all(crate::util::sessions_dir(&cwd).parent().unwrap());
+    }
+
+    #[test]
+    fn delete_removes_all_files_and_second_delete_fails() {
+        let cwd = temp_cwd();
+        let mut s = SessionStore::create(&cwd).unwrap();
+        s.append_message(&Message::text(Role::User, "hi")).unwrap();
+        s.add_checkpoint("ck").unwrap();
+        SessionStore::delete(&cwd, &s.meta.id).unwrap();
+        let dir = crate::util::sessions_dir(&cwd);
+        assert!(!dir.join(format!("{}.meta.json", s.meta.id)).exists());
+        assert!(!dir.join(format!("{}.jsonl", s.meta.id)).exists());
+        assert!(
+            !dir.join(format!("{}.checkpoints.jsonl", s.meta.id))
+                .exists()
+        );
+        // 重复删除：meta 已不存在，明确报错而非静默成功
+        assert!(SessionStore::delete(&cwd, &s.meta.id).is_err());
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }
