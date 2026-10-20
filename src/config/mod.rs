@@ -13,6 +13,37 @@ pub use crate::permission::Mode;
 
 // ---------- CLI 互通 schema（对齐 McodeConfig，逐字段一致） ----------
 
+/// API 协议。Responses = OpenAI Responses API（`POST {baseURL}/responses`，历史唯一协议）；
+/// Chat = OpenAI Chat Completions（`POST {baseURL}/chat/completions`）——
+/// 私有化部署（vLLM/SGLang/one-api 网关的 DeepSeek/Qwen 等）普遍只提供此协议，
+/// 走 Responses 会撞上无路由/转换层不兼容（实测某 vLLM 网关 401/400）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum Protocol {
+    #[default]
+    Responses,
+    Chat,
+}
+
+impl Protocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Protocol::Responses => "responses",
+            Protocol::Chat => "chat",
+        }
+    }
+
+    /// 从配置字符串解析（"responses" | "chat"，大小写不敏感）；未知值返回 None
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "responses" => Some(Protocol::Responses),
+            "chat" | "chat_completions" | "chat-completions" => Some(Protocol::Chat),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 #[derive(Default)]
@@ -27,6 +58,8 @@ pub struct Provider {
     pub models: Vec<String>,
     /// 接受图片输入的模型名单；不在名单内的模型拒绝图片附件并降级文本
     pub multimodal_models: Vec<String>,
+    /// API 协议；旧配置缺省 → Responses（完全向后兼容）
+    pub protocol: Protocol,
 }
 
 impl Provider {
@@ -482,6 +515,7 @@ mod tests {
             api_key_env: "MCODE_TEST_KEY_ENV".into(),
             models: vec![],
             multimodal_models: vec![],
+            protocol: Protocol::default(),
         };
         // SAFETY: 测试进程单线程设置环境变量，无并发读取
         unsafe { std::env::set_var("MCODE_TEST_KEY_ENV", "from-env") };
@@ -568,7 +602,29 @@ mod tests {
             api_key_env: format!("{name}_KEY").to_uppercase(),
             models: models.iter().map(|s| s.to_string()).collect(),
             multimodal_models: vec![],
+            protocol: Protocol::default(),
         }
+    }
+
+    #[test]
+    fn protocol_defaults_to_responses_for_legacy_config() {
+        // 旧配置（无 protocol 字段）→ Responses，完全向后兼容
+        let raw = r#"{"name":"glm","baseURL":"https://x/v1","apiKeyEnv":"K","models":["m"]}"#;
+        let p: Provider = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.protocol, Protocol::Responses);
+    }
+
+    #[test]
+    fn protocol_parses_chat_and_serializes_roundtrip() {
+        let raw = r#"{"name":"kh","baseURL":"https://x/v1","apiKeyEnv":"K","models":["deepseek-v4.1-flash"],"protocol":"chat"}"#;
+        let p: Provider = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.protocol, Protocol::Chat);
+        let out = serde_json::to_string(&p).unwrap();
+        assert!(out.contains(r#""protocol":"chat""#));
+        // parse 容错：大小写与别名
+        assert_eq!(Protocol::parse("CHAT"), Some(Protocol::Chat));
+        assert_eq!(Protocol::parse("responses"), Some(Protocol::Responses));
+        assert_eq!(Protocol::parse("grpc"), None);
     }
 
     #[test]

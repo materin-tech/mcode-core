@@ -2,15 +2,49 @@
 // Copyright (c) 2026 Materin-tech. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//! OpenAI Responses API 客户端 — 唯一协议（对齐 MCode.md 1.5 与 CLI api/client.ts），SSE 流式。
+//! 模型 API 客户端 — 双协议（SSE 流式），按 `provider.protocol` 选择：
+//! - `ResponsesBackend`：OpenAI Responses API（`POST {baseURL}/responses`，历史唯一协议）
+//! - `ChatCompletionsBackend`：OpenAI Chat Completions（`POST {baseURL}/chat/completions`，
+//!   私有化部署 vLLM/SGLang/one-api 网关的 DeepSeek/Qwen 等的事实标准）
+//!
 //! 实现 `agent::ModelBackend`。无请求级超时（只有用户打断能终止长生成）。
+
+mod chat;
+
+pub use chat::ChatCompletionsBackend;
 
 use anyhow::Result;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 use crate::agent::{ApiMessage, Attachment, ModelBackend, StreamEvent, StreamTurn, ToolCall};
-use crate::config::Provider;
+use crate::config::{Protocol, Provider};
+
+/// 按 provider.protocol 构建后端（CLI/Desktop 共用组装入口）
+pub fn build_backend(provider: Provider, model: String) -> Result<Arc<dyn ModelBackend>> {
+    match provider.protocol {
+        Protocol::Responses => Ok(Arc::new(ResponsesBackend::new(provider, model)?)),
+        Protocol::Chat => Ok(Arc::new(ChatCompletionsBackend::new(provider, model)?)),
+    }
+}
+
+/// Bearer 鉴权客户端（两个后端共用：resolve_api_key + Authorization 默认头）
+fn authorized_client(provider: &Provider) -> Result<reqwest::Client> {
+    let key = provider.resolve_api_key().ok_or_else(|| {
+        anyhow::anyhow!(
+            "API key 不可用：环境变量 {} 未设置且值不是明文 key",
+            provider.api_key_env
+        )
+    })?;
+    Ok(reqwest::Client::builder()
+        .default_headers({
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("Authorization", format!("Bearer {key}").parse()?);
+            h
+        })
+        .build()?)
+}
 
 pub struct ResponsesBackend {
     provider: Provider,
@@ -20,19 +54,7 @@ pub struct ResponsesBackend {
 
 impl ResponsesBackend {
     pub fn new(provider: Provider, model: String) -> Result<Self> {
-        let key = provider.resolve_api_key().ok_or_else(|| {
-            anyhow::anyhow!(
-                "API key 不可用：环境变量 {} 未设置且值不是明文 key",
-                provider.api_key_env
-            )
-        })?;
-        let client = reqwest::Client::builder()
-            .default_headers({
-                let mut h = reqwest::header::HeaderMap::new();
-                h.insert("Authorization", format!("Bearer {key}").parse()?);
-                h
-            })
-            .build()?;
+        let client = authorized_client(&provider)?;
         Ok(Self {
             provider,
             model,
