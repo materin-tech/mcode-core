@@ -72,14 +72,16 @@ impl HookEngine {
         } else {
             vec!["-c"]
         };
-        let mut child = tokio::process::Command::new(shell)
-            .args(shell_args)
+        let mut cmd = tokio::process::Command::new(shell);
+        cmd.args(shell_args)
             .arg(command)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        // GUI 子系统父进程（桌面端）spawn console 程序时子进程会弹新控制台窗口
+        crate::util::hide_console_window(&mut cmd);
+        let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(payload.to_string().as_bytes()).await;
             drop(stdin); // 关闭 stdin 让脚本 read 到 EOF

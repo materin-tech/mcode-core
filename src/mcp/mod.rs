@@ -36,13 +36,16 @@ pub struct McpToolInfo {
 impl McpServer {
     /// 连接：spawn 进程 → initialize 握手 → initialized 通知 → tools/list
     pub async fn connect(cfg: &crate::config::McpServerConfig) -> Result<Self> {
-        let mut child = Command::new(&cfg.command)
-            .args(&cfg.args)
+        let mut cmd = Command::new(&cfg.command);
+        cmd.args(&cfg.args)
             .envs(&cfg.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // GUI 子系统父进程（桌面端）spawn console 程序时子进程会弹新控制台窗口
+        crate::util::hide_console_window(&mut cmd);
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("启动 MCP server '{}' 失败: {}", cfg.name, cfg.command))?;
         let stdin = child.stdin.take().context("MCP stdin 缺失")?;

@@ -175,6 +175,21 @@ pub fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Resul
     Ok(())
 }
 
+/// Windows：隐藏子进程的控制台窗口（CREATE_NO_WINDOW = 0x0800_0000）。
+/// 桌面端 exe 是 GUI 子系统进程，spawn cmd / npx 等 console 程序时子进程会
+/// 各自弹出新控制台窗口；这些子进程的 stdio 全部走管道，隐藏窗口不影响
+/// 输入输出采集。非 Windows 平台无操作；CLI 场景父进程本身持有控制台，
+/// 此标志同样无害（对齐 cargo 隐藏子进程的惯用做法）。
+pub fn hide_console_window(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

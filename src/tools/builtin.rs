@@ -226,17 +226,19 @@ impl Tool for Bash {
         let command = str_arg(&input, "command")?;
         let timeout =
             std::time::Duration::from_millis(opt_u64(&input, "timeout_ms").unwrap_or(120_000));
-        let mut child = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-            .args(if cfg!(windows) {
-                ["/C", &command]
-            } else {
-                ["-c", &command]
-            })
-            .current_dir(&ctx.cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        let mut cmd = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+        cmd.args(if cfg!(windows) {
+            ["/C", &command]
+        } else {
+            ["-c", &command]
+        })
+        .current_dir(&ctx.cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+        // GUI 子系统父进程（桌面端）spawn console 程序时子进程会弹新控制台窗口
+        crate::util::hide_console_window(&mut cmd);
+        let mut child = cmd.spawn()?;
         let mut stdout_pipe = child.stdout.take().unwrap();
         let mut stderr_pipe = child.stderr.take().unwrap();
         // 管道并发排空（避免缓冲区满导致死锁）
