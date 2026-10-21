@@ -9,6 +9,8 @@ use std::path::Path;
 
 const MAX_AT_FILE_CHARS: usize = 50_000;
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// @目录 展开的浅层列目录上限（只列立即子项，不递归——深挖交给模型的 glob/read_file）
+const MAX_DIR_ENTRIES: usize = 200;
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
@@ -83,6 +85,12 @@ fn mime_of(path: &str) -> &'static str {
 }
 
 /// 展开 @path 引用。multimodal=false 时图片引用降级为缺失提示（不附加）。
+///
+/// 附件语义（对齐 Claude Code 的 @ 提交处理）：
+/// - 用户正文原样保留，@path 即引用出处；
+/// - @文件 → 文件内容、@目录 → 浅层目录列表，统一包进
+///   `<mcode-attachments>` 结构化块附在正文之后，并把"如何使用这些内容"
+///   的裁量权显式交给模型（可继续用 read_file/glob/grep 深挖）。
 pub fn expand_file_refs(input: &str, cwd: &Path, multimodal: bool) -> FileRefResult {
     let refs = extract_refs(input);
     if refs.is_empty() {
@@ -103,27 +111,46 @@ pub fn expand_file_refs(input: &str, cwd: &Path, multimodal: bool) -> FileRefRes
                 continue;
             }
         };
+        let Ok(meta) = std::fs::metadata(&abs) else {
+            missing.push(r.clone());
+            continue;
+        };
+        if meta.is_dir() {
+            match list_dir_shallow(&abs) {
+                Ok((listing, omitted)) => {
+                    let more = if omitted > 0 {
+                        format!("\n…[另有 {omitted} 项未列出]")
+                    } else {
+                        String::new()
+                    };
+                    injected.push(r.clone());
+                    blocks.push(format!(
+                        "<attachment path=\"{r}\" type=\"directory\">\n{listing}{more}\n</attachment>"
+                    ));
+                }
+                Err(_) => missing.push(r.clone()),
+            }
+            continue;
+        }
         let ext = r.rsplit('.').next().unwrap_or_default().to_lowercase();
         if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-            match std::fs::metadata(&abs) {
-                Ok(m) if m.len() <= MAX_IMAGE_BYTES => {
-                    if !multimodal {
-                        missing.push(format!("{r}（当前模型不支持多模态，图片已忽略）"));
-                        continue;
-                    }
-                    match std::fs::read(&abs) {
-                        Ok(bytes) => {
-                            attachments.push((
-                                r.clone(),
-                                format!("data:{};base64,{}", mime_of(r), use_base64(&bytes)),
-                            ));
-                            injected.push(r.clone());
-                        }
-                        Err(_) => missing.push(r.clone()),
-                    }
+            if meta.len() <= MAX_IMAGE_BYTES {
+                if !multimodal {
+                    missing.push(format!("{r}（当前模型不支持多模态，图片已忽略）"));
+                    continue;
                 }
-                Ok(m) => missing.push(format!("{r}（图片过大: {} bytes）", m.len())),
-                Err(_) => missing.push(r.clone()),
+                match std::fs::read(&abs) {
+                    Ok(bytes) => {
+                        attachments.push((
+                            r.clone(),
+                            format!("data:{};base64,{}", mime_of(r), use_base64(&bytes)),
+                        ));
+                        injected.push(r.clone());
+                    }
+                    Err(_) => missing.push(r.clone()),
+                }
+            } else {
+                missing.push(format!("{r}（图片过大: {} bytes）", meta.len()));
             }
             continue;
         }
@@ -146,7 +173,7 @@ pub fn expand_file_refs(input: &str, cwd: &Path, multimodal: bool) -> FileRefRes
                 };
                 injected.push(r.clone());
                 blocks.push(format!(
-                    "--- file: {r} ---\n{truncated}{more}\n--- end of {r} ---"
+                    "<attachment path=\"{r}\" type=\"file\">\n{truncated}{more}\n</attachment>"
                 ));
             }
             Err(_) => missing.push(r.clone()),
@@ -155,7 +182,13 @@ pub fn expand_file_refs(input: &str, cwd: &Path, multimodal: bool) -> FileRefRes
     let text = if blocks.is_empty() {
         input.to_string()
     } else {
-        format!("{}\n\n{}", input, blocks.join("\n\n"))
+        // 结构化附件块：正文之外单独封套，使用方式交给模型裁量
+        format!(
+            "{}\n\n<mcode-attachments>\n以下是用户在消息中通过 @路径 引用的附件。\
+             请自行判断如何使用这些内容；需要更多上下文时用 read_file/glob/grep 工具继续查看。\n{}\n</mcode-attachments>",
+            input,
+            blocks.join("\n")
+        )
     };
     FileRefResult {
         text,
@@ -163,6 +196,33 @@ pub fn expand_file_refs(input: &str, cwd: &Path, multimodal: bool) -> FileRefRes
         missing,
         attachments,
     }
+}
+
+/// 目录浅层列表：立即子项（目录带 `/` 后缀、排前），超出 MAX_DIR_ENTRIES 截断。
+fn list_dir_shallow(dir: &Path) -> std::io::Result<(String, usize)> {
+    let mut dirs = vec![];
+    let mut files = vec![];
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // 与补全树同口径：默认不带隐藏项
+        }
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            dirs.push(name);
+        } else {
+            files.push(name);
+        }
+    }
+    dirs.sort();
+    files.sort();
+    let total = dirs.len() + files.len();
+    let omitted = total.saturating_sub(MAX_DIR_ENTRIES);
+    let mut lines = vec![];
+    for name in dirs.iter().chain(files.iter()).take(MAX_DIR_ENTRIES) {
+        let is_dir = dirs.contains(name);
+        lines.push(if is_dir { format!("{name}/") } else { name.clone() });
+    }
+    Ok((lines.join("\n"), omitted))
 }
 
 fn use_base64(bytes: &[u8]) -> String {
@@ -212,5 +272,61 @@ mod tests {
         assert_eq!(use_base64(b"Man"), "TWFu");
         assert_eq!(use_base64(b"Ma"), "TWE=");
         assert_eq!(use_base64(b"M"), "TQ==");
+    }
+
+    /// @目录 → 浅层列表附件（不递归）；@文件 → 内容附件；统一封进
+    /// <mcode-attachments>，正文原样保留——对齐 Claude Code 的 @ 提交语义
+    #[test]
+    fn expands_dir_and_file_refs_into_structured_attachments() {
+        let base = std::env::temp_dir().join(format!("mcode-refs-{}", std::process::id()));
+        let dir = base.join("sub");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inner.txt"), "hello").unwrap();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(base.join("README.md"), "# doc").unwrap();
+
+        let input = "看下 @sub 和 @README.md。";
+        let r = expand_file_refs(input, &base, false);
+
+        // 正文原样保留，附件单独封套且把裁量权交给模型
+        assert!(r.text.starts_with(input), "用户正文不得被改写");
+        assert!(r.text.contains("<mcode-attachments>"), "缺附件封套");
+        assert!(r.text.contains("read_file/glob/grep"), "缺模型裁量提示");
+
+        // 目录：浅层列表，目录项带 / 且排前，不递归读 nested 内容
+        assert!(r
+            .text
+            .contains("<attachment path=\"sub\" type=\"directory\">"));
+        let dir_block = r
+            .text
+            .split("<attachment path=\"sub\" type=\"directory\">")
+            .nth(1)
+            .unwrap()
+            .split("</attachment>")
+            .next()
+            .unwrap();
+        assert!(dir_block.contains("inner.txt") && dir_block.contains("nested/"));
+        assert!(!dir_block.contains("hello"), "目录列表不得递归读文件内容");
+
+        // 文件：内容附件
+        assert!(r.text.contains("<attachment path=\"README.md\" type=\"file\">"));
+        assert!(r.text.contains("# doc"));
+
+        assert_eq!(r.injected, vec!["sub", "README.md"]);
+        assert!(r.missing.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// @不存在的路径 → missing 提示，正文不动
+    #[test]
+    fn missing_refs_keep_text_intact() {
+        let base = std::env::temp_dir().join(format!("mcode-refs-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let input = "看下 @ghost.txt";
+        let r = expand_file_refs(input, &base, false);
+        assert_eq!(r.text, input, "无附件时正文不得被追加任何块");
+        assert_eq!(r.missing.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
