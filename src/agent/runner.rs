@@ -21,7 +21,6 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const MAX_TOOL_TURNS: usize = 25;
 pub const MAX_STREAM_RETRIES: usize = 10;
 
 /// 瞬时流式错误（对齐 CLI TRANSIENT_STREAM_ERRORS + reqwest 表述）
@@ -89,6 +88,8 @@ impl AgentDeps {
 pub struct TurnOpts<'a> {
     /// subagent 覆盖系统提示词
     pub instructions: Option<String>,
+    /// 工具轮次上限；0 = 不设上限（主会话与 agent 定义未写 max-turns 的
+    /// subagent 均缺省不限轮次，死循环处理直到任务完成，靠打断 + 压缩门控兜底）
     pub max_turns: usize,
     pub goal: Option<String>,
     /// 工具白名单（subagent）
@@ -168,7 +169,7 @@ pub async fn run_agent_turn(deps: &Arc<AgentDeps>, user_input: &str, opts: TurnO
     let cancel = deps.cancel_tx.subscribe();
 
     let result = loop {
-        if turn_count >= opts.max_turns {
+        if opts.max_turns > 0 && turn_count >= opts.max_turns {
             break Err(anyhow::anyhow!(MAX_TURNS_SENTINEL));
         }
 
@@ -567,6 +568,116 @@ mod tests {
         }
     }
 
+    // ---- mock 后端：连续 finish_after 轮工具调用后收口 ----
+    struct MockLoopBackend {
+        calls: AtomicUsize,
+        finish_after: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelBackend for MockLoopBackend {
+        async fn stream_turn(
+            &self,
+            _system: &str,
+            _history: &[ApiMessage],
+            _user_input: &str,
+            _attachments: &[Attachment],
+            _tools: &[crate::tools::ToolDefinition],
+            _effort: &crate::config::ThinkingEffort,
+            _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+            _cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<StreamTurn> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if n < self.finish_after {
+                StreamTurn {
+                    reply: String::new(),
+                    tool_calls: vec![mock_tool_call()],
+                    usage: None,
+                    interrupted: false,
+                }
+            } else {
+                StreamTurn {
+                    reply: "done!".into(),
+                    tool_calls: vec![],
+                    usage: None,
+                    interrupted: false,
+                }
+            })
+        }
+    }
+
+    fn loop_deps(finish_after: usize) -> Arc<AgentDeps> {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(cancel_rx);
+        let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(8);
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        registry.register(Arc::new(EchoTool));
+        Arc::new(AgentDeps {
+            cfg: crate::config::Config::default(),
+            backend: Arc::new(MockLoopBackend {
+                calls: AtomicUsize::new(0),
+                finish_after,
+            }),
+            registry,
+            perms: Arc::new(tokio::sync::Mutex::new(PermissionManager::new(
+                Mode::Passon,
+                vec![],
+            ))),
+            ledger: Arc::new(tokio::sync::Mutex::new(TokenLedger::default())),
+            hooks: Arc::new(HookEngine::empty()),
+            confirm: confirm_tx,
+            cancel_tx,
+            cwd: std::env::temp_dir(),
+            skills: vec![],
+            agents: Arc::new(vec![]),
+            project_doc: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn unbounded_loop_runs_past_legacy_cap_until_done() {
+        // 30 轮工具调用 > 旧上限 25：主会话 max_turns=0 必须跑完而不是截停
+        let deps = loop_deps(30);
+        let reply = run_agent_turn(
+            &deps,
+            "long task",
+            TurnOpts {
+                instructions: None,
+                max_turns: 0,
+                goal: None,
+                tools_filter: None,
+                attachments: vec![],
+                effort: crate::config::ThinkingEffort::Default,
+                history: &mut HistoryStore::default(),
+                emit: noop_sink(),
+            },
+        )
+        .await;
+        assert_eq!(reply, "done!");
+    }
+
+    #[tokio::test]
+    async fn capped_loop_stops_at_budget() {
+        // 永不收口的 mock：预算 8 轮耗尽必须截停（subagent 语义保留）
+        let deps = loop_deps(usize::MAX);
+        let reply = run_agent_turn(
+            &deps,
+            "runaway task",
+            TurnOpts {
+                instructions: None,
+                max_turns: 8,
+                goal: None,
+                tools_filter: None,
+                attachments: vec![],
+                effort: crate::config::ThinkingEffort::Default,
+                history: &mut HistoryStore::default(),
+                emit: noop_sink(),
+            },
+        )
+        .await;
+        assert_eq!(reply, "(stopped: max tool turns reached)");
+    }
+
     fn test_deps() -> (Arc<AgentDeps>, tokio::sync::mpsc::Receiver<ConfirmRequest>) {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         std::mem::forget(cancel_rx); // 保持至少一个接收者，避免 send 失败
@@ -609,7 +720,7 @@ mod tests {
             "run echo",
             TurnOpts {
                 instructions: None,
-                max_turns: MAX_TOOL_TURNS,
+                max_turns: 25,
                 goal: None,
                 tools_filter: None,
                 attachments: vec![],
@@ -652,7 +763,7 @@ mod tests {
             "run echo",
             TurnOpts {
                 instructions: None,
-                max_turns: MAX_TOOL_TURNS,
+                max_turns: 25,
                 goal: None,
                 tools_filter: None,
                 attachments: vec![],
@@ -686,7 +797,7 @@ mod tests {
             "run echo",
             TurnOpts {
                 instructions: None,
-                max_turns: MAX_TOOL_TURNS,
+                max_turns: 25,
                 goal: None,
                 tools_filter: None,
                 attachments: vec![],
@@ -711,7 +822,7 @@ mod tests {
             "x",
             TurnOpts {
                 instructions: None,
-                max_turns: MAX_TOOL_TURNS,
+                max_turns: 25,
                 goal: None,
                 tools_filter: None,
                 attachments: vec![],

@@ -233,9 +233,9 @@ impl Tool for TaskTool {
             &prompt,
             TurnOpts {
                 instructions: Some(agent.system_prompt.clone()),
-                // 对齐 CLI 实际行为：loop.ts 的 while 用常量 MAX_TOOL_TURNS，
-                // agent.maxTurns 定义了但未被引用——subagent 缺省同样跑满 25 轮
-                max_turns: agent.max_turns.unwrap_or(super::runner::MAX_TOOL_TURNS),
+                // 缺省同样不设轮次上限（对齐主会话）；agent 定义里显式写
+                // max-turns 才有预算
+                max_turns: agent.max_turns.unwrap_or(0),
                 goal: None,
                 tools_filter: agent.tools.clone(),
                 attachments: vec![],
