@@ -1,6 +1,6 @@
 [package]
 name = "mcode-core"
-version = "0.1.0-beta.11"
+version = "0.1.0-beta.12"
 edition = "2024"
 license = "MIT"
 description = "MCode 核心库：agent 回合 / 工具 / 配置 / 会话 / 权限 / hooks / mcp / skills"
