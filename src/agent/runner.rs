@@ -166,7 +166,7 @@ pub async fn run_agent_turn(deps: &Arc<AgentDeps>, user_input: &str, opts: TurnO
     let mut current_input = user_input.to_string();
     let original_input = user_input.to_string();
     let mut turn_count = 0usize;
-    let cancel = deps.cancel_tx.subscribe();
+    let mut cancel = deps.cancel_tx.subscribe();
 
     let result = loop {
         if opts.max_turns > 0 && turn_count >= opts.max_turns {
@@ -409,7 +409,28 @@ pub async fn run_agent_turn(deps: &Arc<AgentDeps>, user_input: &str, opts: TurnO
                 deps: Some(deps.clone()),
                 emit: emit.clone(),
             };
-            let result: Result<crate::tools::ToolResult> = tool.execute(parsed, &ctx).await;
+            // select! 打断：cancel 与工具执行竞争（对流式路径 select! 的同款修复，
+            // 见 api/mod.rs）。此前只在工具之间检查 cancel——构建/测试类长命令
+            // 执行期间 ESC 无效，打断信号直到工具自然结束才落地。弃 future 即
+            // 终止工具（bash 子进程经 kill_on_drop 一并回收）。
+            let result: Result<crate::tools::ToolResult> = tokio::select! {
+                r = tool.execute(parsed, &ctx) => r,
+                _ = cancel.changed() => {
+                    emit(AgentEvent::ToolResult {
+                        name: call.name.clone(),
+                        success: false,
+                        output: "interrupted by user".into(),
+                        display: None,
+                        scope: None,
+                    });
+                    // 回合以中断收口：Done 必须跟随（UI 以 Done 为回合终态信号，
+                    // CLI 端随后 TurnDone → 队列立即出队插队执行）
+                    emit(AgentEvent::Done {
+                        reply: String::new(),
+                    });
+                    return String::new();
+                }
+            };
             let result = match result {
                 Ok(r) => r,
                 Err(e) => crate::tools::ToolResult {
@@ -833,5 +854,105 @@ mod tests {
         )
         .await;
         assert_eq!(reply, "");
+    }
+
+    // ---- 慢工具：挂起 30s，验证工具执行中的打断 ----
+    struct SlowTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SlowTool {
+        fn def(&self) -> crate::tools::ToolDefinition {
+            crate::tools::ToolDefinition {
+                name: "mock_tool".into(),
+                description: "slow".into(),
+                parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+                is_read_only: false,
+            }
+        }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(ToolResult {
+                success: true,
+                output: "slow done".into(),
+                display: None,
+            })
+        }
+    }
+
+    fn slow_tool_deps() -> Arc<AgentDeps> {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(cancel_rx);
+        let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(8);
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        registry.register(Arc::new(SlowTool));
+        Arc::new(AgentDeps {
+            cfg: crate::config::Config::default(),
+            backend: Arc::new(MockBackend {
+                calls: AtomicUsize::new(0),
+            }),
+            registry,
+            perms: Arc::new(tokio::sync::Mutex::new(PermissionManager::new(
+                Mode::Passon,
+                vec![],
+            ))),
+            ledger: Arc::new(tokio::sync::Mutex::new(TokenLedger::default())),
+            hooks: Arc::new(HookEngine::empty()),
+            confirm: confirm_tx,
+            cancel_tx,
+            cwd: std::env::temp_dir(),
+            skills: vec![],
+            agents: Arc::new(vec![]),
+            project_doc: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn cancel_during_tool_execution_aborts_promptly() {
+        // 工具执行中打断必须立即生效：此前只在工具之间检查 cancel，长命令
+        // （构建/测试）期间 ESC 无效。修复后 select! 与工具执行竞争，弃
+        // future 即杀子进程（bash kill_on_drop），回合以空回复终态收口。
+        // CLI 队列策略依赖此终态：TurnDone → pop_queue 立即插队执行。
+        let deps = slow_tool_deps();
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Default::default();
+        let ev_sink: EventSink = {
+            let ev = events.clone();
+            Arc::new(move |e| ev.lock().unwrap().push(e))
+        };
+        let deps_for_cancel = deps.clone();
+        let h = tokio::spawn(async move {
+            let mut history = HistoryStore::default();
+            run_agent_turn(
+                &deps,
+                "run slow",
+                TurnOpts {
+                    instructions: None,
+                    max_turns: 25,
+                    goal: None,
+                    tools_filter: None,
+                    attachments: vec![],
+                    effort: crate::config::ThinkingEffort::Default,
+                    history: &mut history,
+                    emit: ev_sink,
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await; // 进入工具执行
+        deps_for_cancel.cancel_tx.send(true).unwrap();
+        // 修复前：工具 30s sleep 未被弃，此处 5s 必超时失败
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), h)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, "");
+        let ev = events.lock().unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { success: false, output, .. } if output.contains("interrupted")))
+        );
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, AgentEvent::Done { reply: r } if r.is_empty()))
+        );
     }
 }
